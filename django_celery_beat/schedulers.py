@@ -230,6 +230,7 @@ class DatabaseScheduler(Scheduler):
 
     def sync(self):
         info('Writing entries...')
+        info("My log ...")
         _tried = set()
         try:
             with transaction.atomic():

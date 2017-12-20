@@ -1,8 +1,6 @@
 """Beat Scheduler Implementation."""
 from __future__ import absolute_import, unicode_literals
 
-import logging
-
 from multiprocessing.util import Finalize
 
 from celery import current_app
@@ -13,9 +11,12 @@ from celery.utils.encoding import safe_str, safe_repr
 from celery.utils.log import get_logger
 from kombu.utils.json import dumps, loads
 
-from django.db import transaction
+from django.db import transaction, connections
+from django import db
 from django.db.utils import DatabaseError
 from django.core.exceptions import ObjectDoesNotExist
+from psycopg2 import InterfaceError
+from django.db.utils import InterfaceError as IEUtils
 
 from .models import (
     PeriodicTask, PeriodicTasks,
@@ -205,20 +206,27 @@ class DatabaseScheduler(Scheduler):
             # REPEATABLE-READ (default), then we won't see changes done by
             # other transactions until the current transaction is
             # committed (Issue #41).
+            info("Scheduled changed called...")
             try:
+                info("Before transaction commit ...")
                 transaction.commit()
-            except transaction.TransactionManagementError:
+                info("After transaction commit ...")
+            except transaction.TransactionManagementError as tex:
                 pass  # not in transaction management.
 
             last, ts = self._last_timestamp, self.Changes.last_change()
-        except DatabaseError as exc:
-            logger.exception('Database gave error: %r', exc)
+        except (DatabaseError, InterfaceError, IEUtils) as exc:
+            logger.error(f'Database gave error: {exc}')
+            db.close_old_connections()
+
             return False
+
         try:
             if ts and ts > (last if last else ts):
                 return True
         finally:
             self._last_timestamp = ts
+
         return False
 
     def reserve(self, entry):
@@ -230,8 +238,8 @@ class DatabaseScheduler(Scheduler):
 
     def sync(self):
         info('Writing entries...')
-        info("My log ...")
         _tried = set()
+
         try:
             with transaction.atomic():
                 while self._dirty:
@@ -239,12 +247,13 @@ class DatabaseScheduler(Scheduler):
                         name = self._dirty.pop()
                         _tried.add(name)
                         self.schedule[name].save()
-                    except (KeyError, ObjectDoesNotExist):
-                        pass
-        except DatabaseError as exc:
+                    except (KeyError, ObjectDoesNotExist) as ex:
+                        logger.exception(ex)
+
+        except (DatabaseError, InterfaceError, IEUtils) as exc:
             # retry later
             self._dirty |= _tried
-            logger.exception('Database error while sync: %r', exc)
+            logger.error(f"Database error while sync: {exc}")
 
     def update_from_dict(self, mapping):
         s = {}
@@ -276,7 +285,7 @@ class DatabaseScheduler(Scheduler):
     def schedule(self):
         update = False
         if not self._initial_read:
-            debug('DatabaseScheduler: initial read')
+            info('DatabaseScheduler: initial read')
             update = True
             self._initial_read = True
         elif self.schedule_changed():
@@ -284,12 +293,18 @@ class DatabaseScheduler(Scheduler):
             update = True
 
         if update:
+            info("Before sync ...")
             self.sync()
+            info("After sync ...")
             self._schedule = self.all_as_schedule()
             # the schedule changed, invalidate the heap in Scheduler.tick
             self._heap = None
-            if logger.isEnabledFor(logging.DEBUG):
-                debug('Current schedule:\n%s', '\n'.join(
-                    repr(entry) for entry in values(self._schedule)),
-                )
+            info('Current schedule:\n%s', '\n'.join(
+                repr(entry) for entry in values(self._schedule)),
+                 )
+            # if logger.isEnabledFor(logging.DEBUG):
+            #     info('Current schedule:\n%s', '\n'.join(
+            #         repr(entry) for entry in values(self._schedule)),
+            #     )
+
         return self._schedule
